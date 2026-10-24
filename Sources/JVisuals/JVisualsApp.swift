@@ -2,7 +2,7 @@ import MetalKit
 import SwiftUI
 
 @main
-struct PhosphorApp: App {
+struct JVisualsApp: App {
     init() {
         // Only the colour wheel in the system colour panel; must be set before the panel is first created.
         NSColorPanel.setPickerMask(.wheelModeMask)

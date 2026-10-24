@@ -2,9 +2,9 @@
 import PackageDescription
 
 let package = Package(
-    name: "Phosphor",
+    name: "JVisuals",
     platforms: [.macOS("14.2")], // Core Audio process taps arrived in 14.2
     targets: [
-        .executableTarget(name: "Phosphor", path: "Sources/Phosphor")
+        .executableTarget(name: "JVisuals", path: "Sources/JVisuals")
     ]
 )

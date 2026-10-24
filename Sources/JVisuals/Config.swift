@@ -13,10 +13,23 @@ enum VisualMode: String, Codable, CaseIterable, Identifiable {
     }
 }
 
-enum SpectrumStyle: String, Codable, CaseIterable, Identifiable {
-    case line, filled, mirror, bars
+/// What drives the X·Y beam: the two stereo channels, or the signal against a delayed copy of itself
+/// (a phase portrait, which keeps moving even when the music is mono).
+enum XYSource: String, Codable, CaseIterable, Identifiable {
+    case stereo, delay
     var id: Self { self }
     var title: String { rawValue.capitalized }
+}
+
+enum SpectrumStyle: String, Codable, CaseIterable, Identifiable {
+    case line, bars
+    var id: Self { self }
+    var title: String { rawValue.capitalized }
+
+    /// Styles that no longer exist (filled, mirror) load as Line instead of failing the whole config.
+    init(from decoder: Decoder) throws {
+        self = SpectrumStyle(rawValue: try decoder.singleValueContainer().decode(String.self)) ?? .line
+    }
 }
 
 /// Everything the viewer can customise. Persisted as JSON in UserDefaults.
@@ -35,12 +48,18 @@ struct Config: Codable, Equatable {
 
     // X · Y
     var rotateXY = false
+    var xySource: XYSource = .delay
+    var xyDelay: Double = 2.5 // ms
+    var xyWidth: Double = 2
+    var xySpin: Double = 0
+    var autoGain = true
 
     // Spectrum
-    var spectrumStyle: SpectrumStyle = .filled
+    var spectrumStyle: SpectrumStyle = .line
     var smoothing: Double = 0.5
     var showPeaks = true
     var reflection = true
+    var barCount: Double = 48
 
     // Look
     var glow: Double = 1
@@ -62,8 +81,18 @@ final class VisualSettings: ObservableObject {
     }
 
     init() {
-        let data = UserDefaults.standard.data(forKey: Self.key)
-        config = data.flatMap { try? JSONDecoder().decode(Config.self, from: $0) } ?? Config()
+        config = Self.load() ?? Config()
+    }
+
+    /// Saved values laid over the defaults, so settings survive when new fields are added.
+    private static func load() -> Config? {
+        guard let data = UserDefaults.standard.data(forKey: key),
+              let saved = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let defaultData = try? JSONEncoder().encode(Config()),
+              let defaults = try? JSONSerialization.jsonObject(with: defaultData) as? [String: Any],
+              let merged = try? JSONSerialization.data(withJSONObject: defaults.merging(saved) { $1 })
+        else { return nil }
+        return try? JSONDecoder().decode(Config.self, from: merged)
     }
 
     /// Restores the look but keeps the current mode, colours and gain.

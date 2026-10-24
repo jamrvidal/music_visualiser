@@ -115,7 +115,7 @@ final class ProcessTap {
     private var tapID = AudioObjectID(kAudioObjectUnknown)
     private var aggregateID = AudioObjectID(kAudioObjectUnknown)
     private var procID: AudioDeviceIOProcID?
-    private let queue = DispatchQueue(label: "Phosphor.tap", qos: .userInteractive)
+    private let queue = DispatchQueue(label: "JVisuals.tap", qos: .userInteractive)
 
     init(source: AudioSource.Kind, ring: SampleRing) throws {
         let description: CATapDescription
@@ -126,7 +126,7 @@ final class ProcessTap {
             description = CATapDescription(stereoMixdownOfProcesses: [object])
         }
         description.uuid = UUID()
-        description.name = "Phosphor"
+        description.name = "JVisuals"
         description.isPrivate = true
         description.muteBehavior = .unmuted
 
@@ -138,7 +138,7 @@ final class ProcessTap {
             let outputUID = try outputDevice.readString(kAudioDevicePropertyDeviceUID)
 
             let aggregate: [String: Any] = [
-                kAudioAggregateDeviceNameKey: "Phosphor Tap",
+                kAudioAggregateDeviceNameKey: "JVisuals Tap",
                 kAudioAggregateDeviceUIDKey: UUID().uuidString,
                 kAudioAggregateDeviceMainSubDeviceKey: outputUID,
                 kAudioAggregateDeviceIsPrivateKey: true,

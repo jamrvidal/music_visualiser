@@ -20,12 +20,6 @@ private struct Rect {
     var color: SIMD4<Float>
 }
 
-private struct StripVertex {
-    var position: SIMD2<Float>
-    var pad: SIMD2<Float> = .zero
-    var color: SIMD4<Float>
-}
-
 private struct PresentUniforms {
     var gridTint: SIMD4<Float>
     var viewport: SIMD2<Float>
@@ -45,7 +39,6 @@ final class Renderer: NSObject, MTKViewDelegate {
     private let fadePipeline: MTLRenderPipelineState
     private let segmentPipeline: MTLRenderPipelineState
     private let rectPipeline: MTLRenderPipelineState
-    private let stripPipeline: MTLRenderPipelineState
     private let presentPipeline: MTLRenderPipelineState
 
     private let ring: SampleRing
@@ -60,11 +53,14 @@ final class Renderer: NSObject, MTKViewDelegate {
     private var mono = [Float](repeating: 0, count: 1 << 14)
     private var segments: [Segment] = []
     private var rects: [Rect] = []
-    private var strip: [StripVertex] = []
-    private var stripRuns: [Range<Int>] = []
 
     private var xyCursor = 0
-    private var xyLast = SIMD2<Float>.zero
+    /// Where the beam ended last frame; nil after a layout change so the trace starts fresh.
+    private var xyLast: SIMD2<Float>?
+    private var xyHistory = [Float](repeating: 0, count: 1024) // longest delay at 96 kHz ≈ 10 ms
+    private var xyEnvelope: Float = 0.3
+    private var xyScale: Float = 0.85
+    private var xySpinAngle: Float = 0
 
     private let spectrum = Spectrum(log2n: 12)
     private static let bandCount = 128
@@ -77,7 +73,7 @@ final class Renderer: NSObject, MTKViewDelegate {
 
     init(ring: SampleRing, settings: VisualSettings) throws {
         guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue() else {
-            throw NSError(domain: "Phosphor", code: 1, userInfo: [NSLocalizedDescriptionKey: "Metal is unavailable"])
+            throw NSError(domain: "JVisuals", code: 1, userInfo: [NSLocalizedDescriptionKey: "Metal is unavailable"])
         }
         self.device = device
         self.queue = queue
@@ -111,7 +107,6 @@ final class Renderer: NSObject, MTKViewDelegate {
         }
         segmentPipeline = try pipeline("segment_vertex", "segment_fragment", format: .rgba16Float, blend: additive)
         rectPipeline = try pipeline("rect_vertex", "rect_fragment", format: .rgba16Float, blend: additive)
-        stripPipeline = try pipeline("strip_vertex", "strip_fragment", format: .rgba16Float, blend: additive)
         presentPipeline = try pipeline("fullscreen_vertex", "present_fragment", format: .bgra8Unorm)
 
         let count = Self.bandCount
@@ -145,10 +140,11 @@ final class Renderer: NSObject, MTKViewDelegate {
         let config = settings.config
         let palette = Palette(config)
         // Wipe trails when the picture changes shape, so old geometry doesn't ghost into the new one.
-        let layout = "\(config.mode)-\(config.spectrumStyle)-\(config.rotateXY)"
+        let layout = "\(config.mode)-\(config.spectrumStyle)-\(config.rotateXY)-\(config.xySource)"
         if layout != lastLayout {
             clear = true
             lastLayout = layout
+            xyLast = nil
         }
         let now = CACurrentMediaTime()
         let dt = min(now - lastTime, 0.1)
@@ -160,8 +156,6 @@ final class Renderer: NSObject, MTKViewDelegate {
 
         segments.removeAll(keepingCapacity: true)
         rects.removeAll(keepingCapacity: true)
-        strip.removeAll(keepingCapacity: true)
-        stripRuns.removeAll(keepingCapacity: true)
 
         let beamWidth: Float
         let energy: Float
@@ -170,7 +164,7 @@ final class Renderer: NSObject, MTKViewDelegate {
             buildScope(config: config, color: palette.beam.rgba, gain: gain)
             (beamWidth, energy) = (1.1, 1)
         case .xy:
-            buildXY(config: config, color: palette.beam.rgba, gain: gain, aspect: viewport.y / viewport.x)
+            buildXY(config: config, color: palette.beam.rgba, gain: gain, aspect: viewport.y / viewport.x, dt: dt)
             (beamWidth, energy) = (1.0, 1)
         case .spectrum:
             buildSpectrum(config: config, palette: palette, gain: gain, dt: dt, now: now)
@@ -190,13 +184,6 @@ final class Renderer: NSObject, MTKViewDelegate {
             encoder.setRenderPipelineState(fadePipeline)
             encoder.setFragmentBytes(&keepNow, length: MemoryLayout<Float>.size, index: 0)
             encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
-        }
-        if !strip.isEmpty, let buffer = makeBuffer(strip) {
-            encoder.setRenderPipelineState(stripPipeline)
-            encoder.setVertexBuffer(buffer, offset: 0, index: 0)
-            for run in stripRuns {
-                encoder.drawPrimitives(type: .triangleStrip, vertexStart: run.lowerBound, vertexCount: run.count)
-            }
         }
         if !rects.isEmpty, let buffer = makeBuffer(rects) {
             encoder.setRenderPipelineState(rectPipeline)
@@ -270,20 +257,71 @@ final class Renderer: NSObject, MTKViewDelegate {
 
     // MARK: X · Y
 
-    /// Lissajous: left channel drives X, right drives Y (or mid/side when rotated, so mono is vertical).
+    /// Lissajous figure. Each sample gives a pair (a, b): left/right in Stereo, or the mono signal against
+    /// itself a few milliseconds earlier in Delay. The pair is split into mid (a+b) and side (a−b) so Width can
+    /// widen the side, then optionally rotated back so mono lies on the diagonal (classic) or kept upright.
     /// Draws exactly the samples that arrived since the last frame.
-    private func buildXY(config: Config, color: SIMD4<Float>, gain: Float, aspect: Float) {
+    private func buildXY(config: Config, color: SIMD4<Float>, gain: Float, aspect: Float, dt: Double) {
         let count = ring.read(after: &xyCursor, maxCount: 4096, left: &left, right: &right)
-        let scale = 0.85 * gain
-        var previous = xyLast
+        guard count > 0 else { return }
+
+        // Mono history ahead of this frame's samples, so the delayed copy reaches back across frames.
+        let history = xyHistory.count
+        let delay = min(max(Int(config.xyDelay / 1000 * ring.sampleRate), 1), history)
+        if config.xySource == .delay {
+            for i in 0..<count { mono[history + i] = (left[i] + right[i]) * 0.5 }
+            for i in 0..<history { mono[i] = xyHistory[i] }
+        }
+
+        xySpinAngle += Float(config.xySpin * 0.2 * .pi * dt)
+        let spin = SIMD2<Float>(cos(xySpinAngle), sin(xySpinAngle))
+        let width = Float(config.xyWidth)
+
+        var points: [SIMD2<Float>] = []
+        points.reserveCapacity(count)
+        var peak: Float = 0
         for i in 0..<count {
-            var x = left[i], y = right[i]
-            if config.rotateXY {
-                (x, y) = ((x - y) * 0.7071, (x + y) * 0.7071)
+            let (a, b) = config.xySource == .delay ? (mono[history + i], mono[history + i - delay]) : (left[i], right[i])
+            let mid = (a + b) * 0.7071
+            let side = (a - b) * 0.7071 * width
+            var p = config.rotateXY ? SIMD2(side, mid) : SIMD2((mid + side) * 0.7071, (mid - side) * 0.7071)
+            p = SIMD2(p.x * spin.x - p.y * spin.y, p.x * spin.y + p.y * spin.x)
+            peak = max(peak, max(abs(p.x), abs(p.y)))
+            points.append(p)
+        }
+        if config.xySource == .delay {
+            for i in 0..<history { xyHistory[i] = mono[count + i] }
+        }
+
+        // Auto gain follows the recent peak (quick to shrink on loud passages, slow to grow on quiet ones)
+        // so the figure fills the screen at any volume.
+        if config.autoGain {
+            let fall = Float(pow(0.985, dt * 60))
+            xyEnvelope = max(peak, xyEnvelope * fall, 0.05) // floor stops near-silence being blown up to noise
+        }
+        let target = config.autoGain ? 0.8 / xyEnvelope : 0.85
+        xyScale += (target - xyScale) * min(1, Float(dt * 8))
+        let scale = xyScale * gain
+
+        // Where the beam lingers (bass, quiet passages) hundreds of samples land on the same pixels and their
+        // glows stack into harsh, opaque strokes. Merge samples until the beam has moved a little, and let the
+        // brightness grow with log(dwell) rather than linearly.
+        let minStep: Float = 0.004
+        var previous = xyLast
+        var dwell = 0
+        for p in points {
+            let point = SIMD2<Float>(p.x * scale * aspect, p.y * scale)
+            dwell += 1
+            guard let start = previous else {
+                previous = point
+                dwell = 0
+                continue
             }
-            let point = SIMD2<Float>(x * scale * aspect, y * scale)
-            segments.append(Segment(a: previous, b: point, color: color, intensity: 0.35))
+            if simd_distance(point, start) < minStep { continue }
+            let intensity = 0.35 * (1 + 0.6 * log2(Float(dwell)))
+            segments.append(Segment(a: start, b: point, color: color, intensity: intensity))
             previous = point
+            dwell = 0
         }
         xyLast = previous
     }
@@ -302,46 +340,16 @@ final class Renderer: NSObject, MTKViewDelegate {
         }
 
         let curve = Self.resample(levels, perBand: 4)
-        let peakCurve = config.showPeaks ? Self.resample(peaks, perBand: 2) : []
-        let mirrored = config.spectrumStyle == .mirror
-        let base: Float = mirrored ? 0 : -0.38
-        let height: Float = mirrored ? 0.72 : 1.2
-        let fill = config.spectrumStyle != .line
+        let base: Float = -0.38, height: Float = 1.2
+        let color = { (i: Int) in palette.gradient(Float(i) / Float(curve.count - 1)) }
 
-        func x(_ i: Int, of count: Int) -> Float {
-            Self.minX + (Self.maxX - Self.minX) * Float(i) / Float(count - 1)
+        appendCurve(curve, origin: base, direction: 1, height: height, intensity: 1, color: color)
+        if config.showPeaks {
+            appendCurve(Self.resample(peaks, perBand: 2), origin: base, direction: 1, height: height,
+                        intensity: 0.28, color: { _ in palette.peak })
         }
-        func color(_ i: Int, of count: Int) -> SIMD3<Float> {
-            palette.gradient(Float(i) / Float(count - 1))
-        }
-
-        // Each pass draws the curve on one side of the baseline: up, then down (mirror) or reflection.
-        let passes: [(direction: Float, strength: Float)] =
-            mirrored ? [(1, 1), (-1, 1)] : config.reflection ? [(1, 1), (-1, 0.2)] : [(1, 1)]
-        for (direction, strength) in passes {
-            let isReflection = direction < 0 && !mirrored
-            let origin = isReflection ? base - 0.02 : base
-            let reach = isReflection ? height * 0.6 : height
-            if fill {
-                // Fills glow at the curve and fade towards the baseline; reflections fade away from it.
-                let edgeLight: Float = isReflection ? 0 : mirrored ? 0.4 : 0.45
-                let rootLight: Float = isReflection ? 0.6 : mirrored ? 0.12 : 0.03
-                let start = strip.count
-                for i in curve.indices {
-                    let c = color(i, of: curve.count)
-                    let px = x(i, of: curve.count)
-                    let edge = SIMD2<Float>(px, origin + direction * curve[i] * reach)
-                    strip.append(StripVertex(position: edge, color: SIMD4(c * edgeLight * strength, 1)))
-                    strip.append(StripVertex(position: [px, origin], color: SIMD4(c * rootLight * strength, 1)))
-                }
-                stripRuns.append(start..<strip.count)
-            }
-            appendCurve(curve, origin: origin, direction: direction, height: reach, intensity: strength,
-                        color: { color($0, of: curve.count) })
-            if !peakCurve.isEmpty && !isReflection {
-                appendCurve(peakCurve, origin: origin, direction: direction, height: reach, intensity: 0.28,
-                            color: { _ in palette.peak })
-            }
+        if config.reflection {
+            appendCurve(curve, origin: base - 0.02, direction: -1, height: height * 0.6, intensity: 0.2, color: color)
         }
     }
 
@@ -359,13 +367,14 @@ final class Renderer: NSObject, MTKViewDelegate {
     }
 
     private func buildBars(config: Config, palette: Palette) {
-        let groups = 48
-        let perGroup = Self.bandCount / groups
+        let groups = min(max(Int(config.barCount.rounded()), 8), Self.bandCount)
         let slot = (Self.maxX - Self.minX) / Float(groups)
         let width = slot * 0.62
         let base: Float = -0.38, height: Float = 1.2
         for g in 0..<groups {
-            let range = (g * perGroup)..<min((g + 1) * perGroup, Self.bandCount)
+            // Spread all bands across the bars, even when the count doesn't divide evenly.
+            let lo = g * Self.bandCount / groups
+            let range = lo..<max((g + 1) * Self.bandCount / groups, lo + 1)
             let level = levels[range].max() ?? 0
             let peak = peaks[range].max() ?? 0
             let x0 = Self.minX + slot * Float(g) + (slot - width) / 2

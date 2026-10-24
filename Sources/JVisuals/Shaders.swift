@@ -96,26 +96,6 @@ fragment float4 rect_fragment(RectOut in [[stage_in]]) {
     return float4(in.color.rgb * shade, 1.0);
 }
 
-// MARK: Gradient strips (spectrum fills)
-
-struct StripVertex { float2 position; float2 pad; float4 color; };
-
-struct StripOut {
-    float4 position [[position]];
-    float4 color;
-};
-
-vertex StripOut strip_vertex(uint vid [[vertex_id]], const device StripVertex *vertices [[buffer(0)]]) {
-    StripOut out;
-    out.position = float4(vertices[vid].position, 0.0, 1.0);
-    out.color = vertices[vid].color;
-    return out;
-}
-
-fragment float4 strip_fragment(StripOut in [[stage_in]]) {
-    return float4(in.color.rgb, 1.0);
-}
-
 // MARK: Present (bloom, tone map, CRT dressing) on plain black
 
 struct PresentUniforms {
