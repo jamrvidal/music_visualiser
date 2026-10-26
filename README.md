@@ -2,18 +2,20 @@
 
 A macOS visualiser that taps the audio your Mac is playing (Spotify, Music, a browser, anything) and draws it.
 
-- **Scope**: triggered Y–T oscilloscope trace with phosphor persistence.
+- **Scope**: triggered oscilloscope trace with phosphor persistence, as a line or wrapped into a circle.
 - **X · Y**: Lissajous mode: stereo (left vs right) or delay (the signal against itself a few ms earlier, which moves even for mono music), with width, spin and auto gain.
-- **Spectrum**: smooth 128-band curve, drawn as a line or as bars (8–128).
+- **Spectrum**: smooth 128-band curve, drawn as a line, vertical bars, horizontal bars (8–128 bars) or a 3D terrain of ridges receding into the distance.
+- **Pulse**: a shape (circle, triangle, square, hexagon or star) that throbs with the bass and fires
+  expanding rings on each beat.
 
 Glowing lines on plain black. Customisation is a deck of knobs (drag to turn, double-click to reset)
 that slides up from the bottom: colours (colour wheel, hex or R/G/B knobs, with an optional bass-to-treble
-gradient), glow, trails, line weight, CRT lines and per-mode options. Settings persist between launches.
+gradient and automatic colour cycling), glow, trails, line weight, CRT lines and per-mode options. Settings persist between launches.
 
 When Spotify is playing, the title, artist, album, artwork and progress show under the logo, and briefly
 appear on each track change even with the interface hidden.
 
-Keys: ←/→ or 1–3 switch modes, S opens the controls, H hides the interface, F toggles full screen,
+Keys: ←/→ or 1–4 switch modes, S opens the controls, H hides the interface, F toggles full screen,
 Esc closes panels.
 
 Requires macOS 14.2+ (Core Audio process taps).

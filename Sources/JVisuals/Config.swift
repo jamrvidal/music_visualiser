@@ -1,7 +1,7 @@
 import SwiftUI
 
 enum VisualMode: String, Codable, CaseIterable, Identifiable {
-    case scope, xy, spectrum
+    case scope, xy, spectrum, pulse
     var id: Self { self }
 
     var title: String {
@@ -9,8 +9,25 @@ enum VisualMode: String, Codable, CaseIterable, Identifiable {
         case .scope: "Scope"
         case .xy: "X · Y"
         case .spectrum: "Spectrum"
+        case .pulse: "Pulse"
         }
     }
+
+    /// Oscilloscope-style modes get the graticule and the stronger CRT bloom.
+    var isScope: Bool { self == .scope || self == .xy }
+}
+
+enum ScopeStyle: String, Codable, CaseIterable, Identifiable {
+    case line, circle
+    var id: Self { self }
+    var title: String { rawValue.capitalized }
+}
+
+/// The figure Pulse mode draws at the centre and sends out on each beat.
+enum PulseShape: String, Codable, CaseIterable, Identifiable {
+    case circle, triangle, square, hexagon, star
+    var id: Self { self }
+    var title: String { rawValue.capitalized }
 }
 
 /// What drives the X·Y beam: the two stereo channels, or the signal against a delayed copy of itself
@@ -22,11 +39,24 @@ enum XYSource: String, Codable, CaseIterable, Identifiable {
 }
 
 enum SpectrumStyle: String, Codable, CaseIterable, Identifiable {
-    case line, bars
+    case line, bars, horizontalBars, terrain
     var id: Self { self }
-    var title: String { rawValue.capitalized }
 
-    /// Styles that no longer exist (filled, mirror) load as Line instead of failing the whole config.
+    var title: String {
+        switch self {
+        case .line: "Line"
+        case .bars: "Bars"
+        case .horizontalBars: "H-Bars"
+        case .terrain: "Terrain"
+        }
+    }
+
+    var isBars: Bool { self == .bars || self == .horizontalBars }
+    /// Styles with a floor to reflect off.
+    var canReflect: Bool { self == .line || self == .bars }
+    var showsPeaks: Bool { self != .terrain }
+
+    /// Styles that no longer exist (filled, mirror, radial) load as Line instead of failing the whole config.
     init(from decoder: Decoder) throws {
         self = SpectrumStyle(rawValue: try decoder.singleValueContainer().decode(String.self)) ?? .line
     }
@@ -41,8 +71,12 @@ struct Config: Codable, Equatable {
     var primary = "#80D1FF"
     var secondary = "#2E5CFF"
     var gradient = true
+    var cycleColors = false
+    /// Full trips around the colour wheel per minute.
+    var cycleSpeed: Double = 4
 
     // Scope
+    var scopeStyle: ScopeStyle = .line
     var timeSpan: Double = 1024
     var trigger = true
 
@@ -59,7 +93,25 @@ struct Config: Codable, Equatable {
     var smoothing: Double = 0.5
     var showPeaks = true
     var reflection = true
+    /// Line style: fill under the curve with vertical lines (count set by `barCount`).
+    var lineFill = false
     var barCount: Double = 48
+    var terrainHeight: Double = 1
+    /// New ridges per second.
+    var terrainSpeed: Double = 30
+    /// Number of ridges from front to horizon.
+    var terrainDepth: Double = 48
+    var terrainGrid = false
+    /// Terrain: vertical strokes hanging under each ridge (density set by `barCount`).
+    var terrainFill = true
+
+    // Pulse
+    var pulseShape: PulseShape = .hexagon
+    /// How far the bass pushes the shapes outward.
+    var pulsePunch: Double = 1
+    var pulseSpin: Double = 0.3
+    /// 0…1: higher fires rings on softer beats.
+    var pulseSensitivity: Double = 0.5
 
     // Look
     var glow: Double = 1
@@ -137,15 +189,24 @@ struct Palette {
         self.usesGradient = usesGradient
     }
 
-    init(_ config: Config) {
-        self.init(primary: Hex.parse(config.primary) ?? [0.5, 0.82, 1],
-                  secondary: Hex.parse(config.secondary) ?? [0.18, 0.36, 1],
-                  usesGradient: config.gradient)
+    /// The configured colours; with colour cycling on, both are turned around the hue wheel by an amount set
+    /// by the wall clock, so the renderer and the interface stay in step without sharing state.
+    init(_ config: Config, at date: Date = Date()) {
+        var primary = Hex.parse(config.primary) ?? [0.5, 0.82, 1]
+        var secondary = Hex.parse(config.secondary) ?? [0.18, 0.36, 1]
+        if config.cycleColors {
+            let turns = date.timeIntervalSinceReferenceDate * config.cycleSpeed / 60
+            let shift = Float(turns - turns.rounded(.down))
+            primary = primary.hueRotated(by: shift)
+            secondary = secondary.hueRotated(by: shift)
+        }
+        self.init(primary: primary, secondary: secondary, usesGradient: config.gradient)
     }
 
     var beam: SIMD3<Float> { primary }
     var peak: SIMD3<Float> { primary + (SIMD3(repeating: 1) - primary) * 0.5 }
-    var grid: SIMD3<Float> { primary * 0.22 }
+    /// Plain neutral grey, independent of the chosen (or cycling) colours.
+    var grid: SIMD3<Float> { SIMD3(repeating: 0.15) }
 
     /// Spectrum colour across the frequency range, t in 0…1 (secondary at the bass end).
     func gradient(_ t: Float) -> SIMD3<Float> {
@@ -155,6 +216,41 @@ struct Palette {
     var accentColor: Color { Color(simd: primary) }
     var textColor: Color { Color(simd: primary + (SIMD3(repeating: 1) - primary) * 0.85) }
     var panelColor: Color { Color(simd: SIMD3(repeating: 0.03) + primary * 0.02) }
+}
+
+extension SIMD3 where Scalar == Float {
+    /// Same saturation and brightness, hue moved by `turns` of the colour wheel (via HSV).
+    func hueRotated(by turns: Float) -> SIMD3<Float> {
+        let maxC = Swift.max(x, y, z), minC = Swift.min(x, y, z)
+        let delta = maxC - minC
+        guard delta > 1e-5 else { return self } // greys have no hue to turn
+        var hue: Float
+        if maxC == x {
+            hue = (y - z) / delta
+        } else if maxC == y {
+            hue = (z - x) / delta + 2
+        } else {
+            hue = (x - y) / delta + 4
+        }
+        hue = hue / 6 + turns
+        hue -= hue.rounded(.down)
+
+        let saturation = delta / maxC
+        let h = hue * 6
+        let sector = Int(h) % 6
+        let f = h - Float(Int(h))
+        let p = maxC * (1 - saturation)
+        let q = maxC * (1 - saturation * f)
+        let t = maxC * (1 - saturation * (1 - f))
+        switch sector {
+        case 0: return [maxC, t, p]
+        case 1: return [q, maxC, p]
+        case 2: return [p, maxC, t]
+        case 3: return [p, q, maxC]
+        case 4: return [t, p, maxC]
+        default: return [maxC, p, q]
+        }
+    }
 }
 
 extension Color {

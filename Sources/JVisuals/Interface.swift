@@ -48,8 +48,10 @@ struct ContentView: View {
     @State private var hideTask: Task<Void, Never>?
     @State private var trackTask: Task<Void, Never>?
     @State private var keyMonitor: Any?
+    /// Ticks while colours cycle so the interface glow follows the visuals.
+    @State private var paletteDate = Date()
 
-    private var palette: Palette { Palette(settings.config) }
+    private var palette: Palette { Palette(settings.config, at: paletteDate) }
 
     var body: some View {
         ZStack {
@@ -85,6 +87,12 @@ struct ContentView: View {
         }
         .onChange(of: nowPlaying.track?.id) { _, id in
             if id != nil { announceTrack() }
+        }
+        .task(id: settings.config.cycleColors) {
+            while settings.config.cycleColors && !Task.isCancelled {
+                paletteDate = Date()
+                try? await Task.sleep(for: .milliseconds(66))
+            }
         }
         .onDisappear {
             if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
@@ -207,7 +215,7 @@ struct ContentView: View {
         }
     }
 
-    /// ←/→ or 1–3 switch modes, S opens the controls, H hides the interface, F full screen.
+    /// ←/→ or 1–4 switch modes, S opens the controls, H hides the interface, F full screen.
     private func installKeys() {
         guard keyMonitor == nil else { return }
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
@@ -218,7 +226,7 @@ struct ContentView: View {
             case (53, _): closePopups()
             case (123, _): settings.config.mode = modes[(index + modes.count - 1) % modes.count]
             case (124, _): settings.config.mode = modes[(index + 1) % modes.count]
-            case (_, "1"), (_, "2"), (_, "3"): settings.config.mode = modes[Int(key)! - 1]
+            case (_, "1"), (_, "2"), (_, "3"), (_, "4"): settings.config.mode = modes[Int(key)! - 1]
             case (_, "s"):
                 withAnimation(.spring(response: 0.4, dampingFraction: 0.85)) { showSettings.toggle() }
             case (_, "h"):
@@ -283,7 +291,15 @@ private struct ControlDeck: View {
                                     .transition(.opacity)
                             }
                         }
-                        Switch(label: "Gradient", isOn: $settings.config.gradient)
+                        VStack(alignment: .leading, spacing: 14) {
+                            Switch(label: "Gradient", isOn: $settings.config.gradient)
+                            Switch(label: "Cycle", isOn: $settings.config.cycleColors)
+                        }
+                        if settings.config.cycleColors {
+                            GlowKnob(label: "Speed", value: $settings.config.cycleSpeed, range: 0.5...30,
+                                     defaultValue: 4) { String(format: "%.0f s", 60 / $0) }
+                                .transition(.opacity)
+                        }
                     }
                     divider
                     modeGroup
@@ -298,7 +314,7 @@ private struct ControlDeck: View {
                         }
                         GlowKnob(label: "CRT", value: $settings.config.scanlines, range: 0...1, defaultValue: 0,
                                  readout: percent)
-                        if settings.config.mode != .spectrum {
+                        if settings.config.mode.isScope {
                             Switch(label: "Grid", isOn: $settings.config.grid)
                         }
                     }
@@ -327,21 +343,64 @@ private struct ControlDeck: View {
             group("Spectrum") {
                 CycleButton(label: "Style", options: SpectrumStyle.allCases,
                             selection: $settings.config.spectrumStyle) { $0.title }
-                if settings.config.spectrumStyle == .bars {
-                    GlowKnob(label: "Bars", value: $settings.config.barCount, range: 8...128, defaultValue: 48) {
+                let style = settings.config.spectrumStyle
+                let filled = (style == .line && settings.config.lineFill)
+                    || (style == .terrain && settings.config.terrainFill)
+                if style.isBars || filled {
+                    GlowKnob(label: filled ? "Lines" : "Bars", value: $settings.config.barCount, range: 8...128,
+                             defaultValue: 48) {
                         "\(Int($0.rounded()))"
                     }
                     .transition(.opacity)
                 }
+                if settings.config.spectrumStyle == .terrain {
+                    GlowKnob(label: "Height", value: $settings.config.terrainHeight, range: 0.2...2, defaultValue: 1,
+                             readout: percent)
+                    GlowKnob(label: "Speed", value: $settings.config.terrainSpeed, range: 5...60, defaultValue: 30) {
+                        String(format: "%.0f/s", $0)
+                    }
+                    GlowKnob(label: "Depth", value: $settings.config.terrainDepth, range: 16...96, defaultValue: 48) {
+                        "\(Int($0.rounded()))"
+                    }
+                }
                 GlowKnob(label: "Smooth", value: $settings.config.smoothing, range: 0...1, defaultValue: 0.5,
                          readout: percent)
                 VStack(alignment: .leading, spacing: 14) {
-                    Switch(label: "Peaks", isOn: $settings.config.showPeaks)
-                    Switch(label: "Reflect", isOn: $settings.config.reflection)
+                    if style == .line {
+                        Switch(label: "Fill", isOn: $settings.config.lineFill)
+                    }
+                    if style == .terrain {
+                        Switch(label: "Fill", isOn: $settings.config.terrainFill)
+                    }
+                    if settings.config.spectrumStyle.showsPeaks {
+                        Switch(label: "Peaks", isOn: $settings.config.showPeaks)
+                    }
+                    if settings.config.spectrumStyle.canReflect {
+                        Switch(label: "Reflect", isOn: $settings.config.reflection)
+                    }
+                    if settings.config.spectrumStyle == .terrain {
+                        Switch(label: "Grid", isOn: $settings.config.terrainGrid)
+                    }
                 }
+            }
+        case .pulse:
+            group("Pulse") {
+                CycleButton(label: "Shape", options: PulseShape.allCases, selection: $settings.config.pulseShape) {
+                    $0.title
+                }
+                GlowKnob(label: "Punch", value: $settings.config.pulsePunch, range: 0...2, defaultValue: 1,
+                         readout: percent)
+                GlowKnob(label: "Spin", value: $settings.config.pulseSpin, range: -1...1, defaultValue: 0.3) {
+                    String(format: "%+.0f%%", $0 * 100)
+                }
+                GlowKnob(label: "Sense", value: $settings.config.pulseSensitivity, range: 0...1, defaultValue: 0.5,
+                         readout: percent)
             }
         case .scope:
             group("Scope") {
+                CycleButton(label: "Style", options: ScopeStyle.allCases, selection: $settings.config.scopeStyle) {
+                    $0.title
+                }
                 GlowKnob(label: "Time", value: $settings.config.timeSpan, range: 256...4096, defaultValue: 1024) {
                     String(format: "%.0f ms", $0 / sampleRate * 1000)
                 }

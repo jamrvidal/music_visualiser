@@ -72,6 +72,7 @@ fragment float4 segment_fragment(SegmentOut in [[stage_in]], constant SegmentUni
 
 // MARK: Rectangles (spectrum bars)
 
+// color.w is the axis the bar grows along: 0 = up (shade by y), 1 = right (shade by x).
 struct Rect { float4 bounds; float4 color; };
 
 struct RectOut {
@@ -92,8 +93,28 @@ vertex RectOut rect_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
 }
 
 fragment float4 rect_fragment(RectOut in [[stage_in]]) {
-    float shade = 0.35 + 0.65 * in.uv.y;
-    return float4(in.color.rgb * shade, 1.0);
+    float shade = 0.35 + 0.65 * (in.color.w > 0.5 ? in.uv.x : in.uv.y);
+    // Fade the outermost pixel by how much of it the bar covers, so thin bars glide instead of
+    // snapping a whole pixel at a time.
+    float2 edge = min(in.uv, 1.0 - in.uv) / max(fwidth(in.uv), float2(1e-5));
+    float coverage = saturate(min(edge.x, edge.y) + 0.5);
+    return float4(in.color.rgb * shade * coverage, 1.0);
+}
+
+// MARK: Occlusion masks (terrain)
+
+// Solid black drawn (without blending) under each terrain ridge, back to front, so nearer ridges
+// hide the ones behind them.
+struct MaskOut { float4 position [[position]]; };
+
+vertex MaskOut mask_vertex(uint vid [[vertex_id]], const device float2 *points [[buffer(0)]]) {
+    MaskOut out;
+    out.position = float4(points[vid], 0.0, 1.0);
+    return out;
+}
+
+fragment float4 mask_fragment(MaskOut in [[stage_in]]) {
+    return float4(0.0, 0.0, 0.0, 1.0);
 }
 
 // MARK: Present (bloom, tone map, CRT dressing) on plain black
@@ -107,14 +128,24 @@ struct PresentUniforms {
     float scanlines;
 };
 
+// One bloom layer from a downscaled mip. Four bilinear taps a texel apart form a tent filter, which hides
+// the blocky look a single stretched low-res sample has.
+float3 bloomLayer(texture2d<float> accum, sampler s, float2 uv, float lod, float2 viewport) {
+    float2 texel = exp2(lod) / viewport;
+    return 0.25 * (accum.sample(s, uv + texel * float2( 1,  1), level(lod)).rgb
+                 + accum.sample(s, uv + texel * float2(-1,  1), level(lod)).rgb
+                 + accum.sample(s, uv + texel * float2( 1, -1), level(lod)).rgb
+                 + accum.sample(s, uv + texel * float2(-1, -1), level(lod)).rgb);
+}
+
 fragment float4 present_fragment(FSOut in [[stage_in]],
                                  texture2d<float> accum [[texture(0)]],
                                  constant PresentUniforms &p [[buffer(0)]]) {
     constexpr sampler s(filter::linear, mip_filter::linear, address::clamp_to_edge);
     float3 light = accum.sample(s, in.uv, level(0.0)).rgb;
-    float3 bloom = accum.sample(s, in.uv, level(2.0)).rgb * 0.5
-                 + accum.sample(s, in.uv, level(4.0)).rgb * 0.3
-                 + accum.sample(s, in.uv, level(6.0)).rgb * 0.2;
+    float3 bloom = bloomLayer(accum, s, in.uv, 1.5, p.viewport) * 0.5
+                 + bloomLayer(accum, s, in.uv, 3.5, p.viewport) * 0.3
+                 + bloomLayer(accum, s, in.uv, 5.5, p.viewport) * 0.2;
     light += bloom * p.bloom;
     float3 c = 1.0 - exp(-light * p.exposure);
 
