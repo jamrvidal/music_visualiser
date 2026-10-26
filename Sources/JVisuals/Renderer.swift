@@ -41,11 +41,17 @@ final class Renderer: NSObject, MTKViewDelegate {
     private let rectPipeline: MTLRenderPipelineState
     private let maskPipeline: MTLRenderPipelineState
     private let presentPipeline: MTLRenderPipelineState
+    private let bloomDownPipeline: MTLRenderPipelineState
+    private let bloomUpPipeline: MTLRenderPipelineState
 
     private let ring: SampleRing
     private let settings: VisualSettings
 
     private var accum: MTLTexture?
+    /// Successively halved, blurred copies of `accum` (½, ¼ … down to about 1/64) that make the glow.
+    private var bloomChain: [MTLTexture] = []
+    /// How much of the wider levels each level takes in on the way back up; higher spreads the glow further.
+    private static let bloomSpread: Double = 0.6
     private var lastLayout: String?
     private var lastTime = CACurrentMediaTime()
 
@@ -114,6 +120,13 @@ final class Renderer: NSObject, MTKViewDelegate {
         rectPipeline = try pipeline("rect_vertex", "rect_fragment", format: .rgba16Float, blend: additive)
         maskPipeline = try pipeline("mask_vertex", "mask_fragment", format: .rgba16Float)
         presentPipeline = try pipeline("fullscreen_vertex", "present_fragment", format: .bgra8Unorm)
+        bloomDownPipeline = try pipeline("fullscreen_vertex", "bloom_down_fragment", format: .rgba16Float)
+        bloomUpPipeline = try pipeline("fullscreen_vertex", "bloom_up_fragment", format: .rgba16Float) {
+            $0.sourceRGBBlendFactor = .blendColor
+            $0.destinationRGBBlendFactor = .oneMinusBlendColor
+            $0.sourceAlphaBlendFactor = .zero
+            $0.destinationAlphaBlendFactor = .one
+        }
 
         let count = Self.bandCount
         bandEdges = (0...count).map { 25 * pow(18_000 / 25, Double($0) / Double(count)) }
@@ -139,12 +152,13 @@ final class Renderer: NSObject, MTKViewDelegate {
         var clear = false
         if accum == nil {
             accum = makeAccumulation(width: Int(size.width), height: Int(size.height))
+            bloomChain = makeBloomChain(width: Int(size.width), height: Int(size.height))
             clear = true
         }
-        guard let accum else { return }
+        guard let accum, let bloomTop = bloomChain.first else { return }
 
         let config = settings.config
-        let palette = Palette(config)
+        let palette = Palette(settings)
         // Wipe trails when the picture changes shape, so old geometry doesn't ghost into the new one.
         let layout = "\(config.mode)-\(config.spectrumStyle)-\(config.scopeStyle)-\(config.rotateXY)-\(config.xySource)"
         if layout != lastLayout {
@@ -229,10 +243,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         }
         encoder.endEncoding()
 
-        if let blit = commands.makeBlitCommandEncoder() {
-            blit.generateMipmaps(for: accum)
-            blit.endEncoding()
-        }
+        encodeBloom(commands, from: accum)
 
         guard let present = commands.makeRenderCommandEncoder(descriptor: presentPass) else { return }
         let isScope = config.mode.isScope
@@ -245,6 +256,7 @@ final class Renderer: NSObject, MTKViewDelegate {
             scanlines: Float(config.scanlines) * 0.5)
         present.setRenderPipelineState(presentPipeline)
         present.setFragmentTexture(accum, index: 0)
+        present.setFragmentTexture(bloomTop, index: 1)
         present.setFragmentBytes(&uniforms, length: MemoryLayout<PresentUniforms>.stride, index: 0)
         present.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         present.endEncoding()
@@ -754,10 +766,51 @@ final class Renderer: NSObject, MTKViewDelegate {
 
     private func makeAccumulation(width: Int, height: Int) -> MTLTexture? {
         let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: width, height: height,
-                                                            mipmapped: true)
+                                                            mipmapped: false)
         desc.usage = [.renderTarget, .shaderRead]
         desc.storageMode = .private
         return device.makeTexture(descriptor: desc)
+    }
+
+    private func makeBloomChain(width: Int, height: Int) -> [MTLTexture] {
+        var chain: [MTLTexture] = []
+        var (w, h) = (width / 2, height / 2)
+        while chain.count < 6, w >= 8, h >= 8, let level = makeAccumulation(width: w, height: h) {
+            chain.append(level)
+            (w, h) = (w / 2, h / 2)
+        }
+        return chain
+    }
+
+    /// Filters `source` down the chain, then back up, each level blending in the blurrier one below it.
+    /// The top level ends up holding the whole glow.
+    private func encodeBloom(_ commands: MTLCommandBuffer, from source: MTLTexture) {
+        func pass(into target: MTLTexture, keep: Bool, _ draw: (MTLRenderCommandEncoder) -> Void) {
+            let desc = MTLRenderPassDescriptor()
+            desc.colorAttachments[0].texture = target
+            desc.colorAttachments[0].loadAction = keep ? .load : .dontCare
+            desc.colorAttachments[0].storeAction = .store
+            guard let encoder = commands.makeRenderCommandEncoder(descriptor: desc) else { return }
+            draw(encoder)
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+            encoder.endEncoding()
+        }
+        var input = source
+        for level in bloomChain {
+            pass(into: level, keep: false) {
+                $0.setRenderPipelineState(bloomDownPipeline)
+                $0.setFragmentTexture(input, index: 0)
+            }
+            input = level
+        }
+        let spread = Self.bloomSpread
+        for i in stride(from: bloomChain.count - 2, through: 0, by: -1) {
+            pass(into: bloomChain[i], keep: true) {
+                $0.setRenderPipelineState(bloomUpPipeline)
+                $0.setBlendColor(red: Float(spread), green: Float(spread), blue: Float(spread), alpha: 1)
+                $0.setFragmentTexture(bloomChain[i + 1], index: 0)
+            }
+        }
     }
 
     private func makeBuffer<T>(_ items: [T]) -> MTLBuffer? {

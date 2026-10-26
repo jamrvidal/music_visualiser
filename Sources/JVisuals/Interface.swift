@@ -2,9 +2,37 @@ import AppKit
 import SwiftUI
 
 enum Typeface {
+    /// The font bundled from Support/Fonts (the PS2-style face), registered on first use. Nil without one,
+    /// in which case the interface falls back to SF Rounded.
+    private static let bundledName: String? = {
+        guard let folder = Bundle.main.resourceURL?.appendingPathComponent("Fonts"),
+              let files = try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil),
+              let url = files.first(where: { ["ttf", "otf"].contains($0.pathExtension.lowercased()) }),
+              let descriptor = (CTFontManagerCreateFontDescriptorsFromURL(url as CFURL) as? [CTFontDescriptor])?.first
+        else { return nil }
+        CTFontManagerRegisterFontsForURL(url as CFURL, .process, nil)
+        return CTFontDescriptorCopyAttribute(descriptor, kCTFontNameAttribute) as? String
+    }()
+
+    /// The bundled face has a single weight, so `weight` only applies to the fallback. Its letters sit small in
+    /// their em square, so it's scaled up to match the sizes the layout was designed with.
     static func font(_ size: CGFloat, _ weight: Font.Weight = .light) -> Font {
-        .system(size: size, weight: weight, design: .rounded)
+        if let bundledName { return .custom(bundledName, fixedSize: (size * 1.3).rounded()) }
+        return .system(size: size, weight: weight, design: .rounded)
     }
+
+    /// Letter spacing; the bundled face is already wide, so it gets less.
+    static func tracking(_ amount: CGFloat) -> CGFloat {
+        bundledName == nil ? amount : amount * 0.4
+    }
+
+    /// The bundled face's lowercase is a cramped small-caps, so everything is set in capitals with it.
+    static var textCase: Text.Case? { bundledName == nil ? nil : .uppercase }
+
+    // Symbols the bundled face draws as blanks get plain stand-ins.
+    static var times: String { bundledName == nil ? "×" : "x" }
+    static var dot: String { bundledName == nil ? "·" : "/" }
+    static var degrees: String { bundledName == nil ? "°" : "" }
 }
 
 private struct PaletteKey: EnvironmentKey {
@@ -32,7 +60,7 @@ private struct Caption: View {
     var body: some View {
         Text(text.uppercased())
             .font(Typeface.font(10, .medium))
-            .tracking(3)
+            .tracking(Typeface.tracking(3))
             .foregroundStyle(palette.textColor.opacity(0.45))
     }
 }
@@ -48,10 +76,10 @@ struct ContentView: View {
     @State private var hideTask: Task<Void, Never>?
     @State private var trackTask: Task<Void, Never>?
     @State private var keyMonitor: Any?
-    /// Ticks while colours cycle so the interface glow follows the visuals.
+    /// Ticks while colours cycle or crossfade so the interface glow follows the visuals.
     @State private var paletteDate = Date()
 
-    private var palette: Palette { Palette(settings.config, at: paletteDate) }
+    private var palette: Palette { Palette(settings, at: paletteDate) }
 
     var body: some View {
         ZStack {
@@ -78,6 +106,7 @@ struct ContentView: View {
         .ignoresSafeArea()
         .background(Color.black)
         .environment(\.palette, palette)
+        .textCase(Typeface.textCase)
         .onContinuousHover { _ in revealControls() }
         .onAppear {
             capture.start()
@@ -88,11 +117,16 @@ struct ContentView: View {
         .onChange(of: nowPlaying.track?.id) { _, id in
             if id != nil { announceTrack() }
         }
-        .task(id: settings.config.cycleColors) {
-            while settings.config.cycleColors && !Task.isCancelled {
+        .task(id: "\(settings.config.cycleColors) \(settings.fadeStart)") {
+            let fadeEnd = settings.fadeStart.addingTimeInterval(VisualSettings.fadeDuration)
+            while (settings.config.cycleColors || Date() < fadeEnd) && !Task.isCancelled {
                 paletteDate = Date()
                 try? await Task.sleep(for: .milliseconds(66))
             }
+            paletteDate = Date()
+        }
+        .task(id: "\(settings.config.albumColors) \(nowPlaying.track == nil) \(nowPlaying.track?.artwork?.absoluteString ?? "")") {
+            await syncAlbumColors()
         }
         .onDisappear {
             if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
@@ -133,7 +167,7 @@ struct ContentView: View {
             VStack(alignment: .trailing, spacing: 6) {
                 Text("JVISUALS")
                     .font(Typeface.font(13, .regular))
-                    .tracking(8)
+                    .tracking(Typeface.tracking(8))
                     .foregroundStyle(palette.textColor.opacity(0.75))
                     .glow(palette.accentColor, 0.5)
                 if let status = capture.status {
@@ -158,7 +192,7 @@ struct ContentView: View {
                     GlowKnob(label: "Gain",
                              value: Binding(get: { log2(settings.config.gain) },
                                             set: { settings.config.gain = pow(2, $0) }),
-                             range: -2...2.6, defaultValue: 0, size: 40) { String(format: "×%.1f", pow(2, $0)) }
+                             range: -2...2.6, defaultValue: 0, size: 40) { String(format: "\(Typeface.times)%.1f", pow(2, $0)) }
                     Button {
                         withAnimation(.spring(response: 0.4, dampingFraction: 0.85)) {
                             showSources = false
@@ -167,7 +201,7 @@ struct ContentView: View {
                     } label: {
                         HStack(spacing: 8) {
                             Image(systemName: "dial.medium").font(.system(size: 12, weight: .medium))
-                            Text("CONTROLS").font(Typeface.font(11, .medium)).tracking(3)
+                            Text("CONTROLS").font(Typeface.font(11, .medium)).tracking(Typeface.tracking(3))
                         }
                         .foregroundStyle(palette.textColor.opacity(0.6))
                         .contentShape(Rectangle())
@@ -191,6 +225,20 @@ struct ContentView: View {
             showSettings = false
         }
         revealControls()
+    }
+
+    /// With album colours on, takes the colours from the playing track's artwork; otherwise (or with nothing
+    /// playing) fades back to the chosen ones.
+    private func syncAlbumColors() async {
+        guard settings.config.albumColors, let track = nowPlaying.track else {
+            settings.setArtworkColors(nil)
+            return
+        }
+        // The artwork URL arrives a moment after a track change; keep the old colours until then.
+        guard let url = track.artwork else { return }
+        let colors = await ArtworkColors.load(url)
+        guard !Task.isCancelled else { return }
+        settings.setArtworkColors(colors)
     }
 
     /// Shows the now-playing card for a few seconds on a track change, even with the interface hidden.
@@ -259,7 +307,7 @@ private struct ControlDeck: View {
             HStack(spacing: 18) {
                 Text("CONTROLS")
                     .font(Typeface.font(15, .regular))
-                    .tracking(6)
+                    .tracking(Typeface.tracking(6))
                     .foregroundStyle(palette.textColor)
                     .glow(palette.accentColor, 0.6)
                 Spacer()
@@ -268,7 +316,7 @@ private struct ControlDeck: View {
                 }
                 .buttonStyle(.plain)
                 .font(Typeface.font(10, .medium))
-                .tracking(3)
+                .tracking(Typeface.tracking(3))
                 .foregroundStyle(palette.textColor.opacity(0.5))
                 .help("Reset the look (keeps mode, colours and gain)")
                 Button(action: close) {
@@ -291,7 +339,11 @@ private struct ControlDeck: View {
                                     .transition(.opacity)
                             }
                         }
+                        // Only used when there's no artwork to take colours from.
+                        .opacity(settings.config.albumColors ? 0.4 : 1)
+                        .help(settings.config.albumColors ? "Used when nothing is playing in Spotify" : "")
                         VStack(alignment: .leading, spacing: 14) {
+                            Switch(label: "Album", isOn: $settings.config.albumColors)
                             Switch(label: "Gradient", isOn: $settings.config.gradient)
                             Switch(label: "Cycle", isOn: $settings.config.cycleColors)
                         }
@@ -310,7 +362,7 @@ private struct ControlDeck: View {
                         GlowKnob(label: "Trails", value: $settings.config.trails, range: 0...1, defaultValue: 0.6,
                                  readout: percent)
                         GlowKnob(label: "Line", value: $settings.config.thickness, range: 0.5...3, defaultValue: 1) {
-                            String(format: "%.1f×", $0)
+                            String(format: "%.1f\(Typeface.times)", $0)
                         }
                         GlowKnob(label: "CRT", value: $settings.config.scanlines, range: 0...1, defaultValue: 0,
                                  readout: percent)
@@ -407,7 +459,7 @@ private struct ControlDeck: View {
                 Switch(label: "Trigger", isOn: $settings.config.trigger)
             }
         case .xy:
-            group("X · Y") {
+            group("X \(Typeface.dot) Y") {
                 CycleButton(label: "Input", options: XYSource.allCases, selection: $settings.config.xySource) {
                     $0.title
                 }
@@ -418,14 +470,14 @@ private struct ControlDeck: View {
                     .transition(.opacity)
                 }
                 GlowKnob(label: "Width", value: $settings.config.xyWidth, range: 0...4, defaultValue: 2) {
-                    String(format: "%.1f×", $0)
+                    String(format: "%.1f\(Typeface.times)", $0)
                 }
                 GlowKnob(label: "Spin", value: $settings.config.xySpin, range: -1...1, defaultValue: 0) {
-                    String(format: "%+.0f°/s", $0 * 36)
+                    String(format: "%+.0f\(Typeface.degrees)/s", $0 * 36)
                 }
                 VStack(alignment: .leading, spacing: 14) {
                     Switch(label: "Auto gain", isOn: $settings.config.autoGain)
-                    Switch(label: "Rotate 45°", isOn: $settings.config.rotateXY)
+                    Switch(label: "Rotate 45\(Typeface.degrees)", isOn: $settings.config.rotateXY)
                 }
             }
         }
@@ -460,14 +512,14 @@ private struct NowPlayingCard: View {
             VStack(alignment: .trailing, spacing: 4) {
                 Text(nowPlaying.isPlaying ? "NOW PLAYING" : "PAUSED")
                     .font(Typeface.font(9, .medium))
-                    .tracking(3)
+                    .tracking(Typeface.tracking(3))
                     .foregroundStyle(palette.textColor.opacity(0.45))
                 Text(track.title)
                     .font(Typeface.font(17, .regular))
                     .foregroundStyle(palette.textColor)
                     .glow(palette.accentColor, 0.4)
                     .lineLimit(1)
-                Text([track.artist, track.album].filter { !$0.isEmpty }.joined(separator: "  ·  "))
+                Text([track.artist, track.album].filter { !$0.isEmpty }.joined(separator: "  \(Typeface.dot)  "))
                     .font(Typeface.font(12))
                     .foregroundStyle(palette.textColor.opacity(0.55))
                     .lineLimit(1)
@@ -549,7 +601,7 @@ private struct ModeDial: View {
 
             Text(mode.title.uppercased())
                 .font(Typeface.font(26))
-                .tracking(5)
+                .tracking(Typeface.tracking(5))
                 .foregroundStyle(palette.textColor)
                 .glow(palette.accentColor)
                 .id(mode)
@@ -595,7 +647,7 @@ private struct ColorRow: View {
                 }
                 Text(label.uppercased())
                     .font(Typeface.font(9, .medium))
-                    .tracking(2)
+                    .tracking(Typeface.tracking(2))
                     .foregroundStyle(palette.textColor.opacity(0.45))
             }
             channel("R", 0, tint: Color(red: 1, green: 0.3, blue: 0.3))
@@ -707,9 +759,10 @@ private struct GlowKnob: View {
                 .onHover { hovering = $0 }
             Text(dragStart != nil || hovering ? readout(value) : label.uppercased())
                 .font(Typeface.font(9, .medium).monospacedDigit())
-                .tracking(1.5)
+                .tracking(Typeface.tracking(1.5))
                 .foregroundStyle(palette.textColor.opacity(dragStart != nil || hovering ? 0.9 : 0.45))
                 .lineLimit(1)
+                .fixedSize() // a long word may overhang the slot rather than be cut off
                 .frame(width: max(size + 14, 40))
         }
         .help(defaultValue == nil ? "Drag to turn" : "Drag to turn · double-click to reset")
@@ -755,10 +808,11 @@ private struct CycleButton<Option: Hashable & Identifiable>: View {
             .onHover { hovering = $0 }
             Text(hovering ? label.uppercased() : title(selection).uppercased())
                 .font(Typeface.font(9, .medium))
-                .tracking(1.5)
+                .tracking(Typeface.tracking(1.5))
                 .foregroundStyle(palette.textColor.opacity(0.9))
                 .glow(palette.accentColor, hovering ? 0 : 0.4)
                 .lineLimit(1)
+                .fixedSize()
                 .frame(width: size + 14)
         }
         .help("\(label): click for the next option")
@@ -803,7 +857,7 @@ private struct Switch: View {
             GlowToggle(isOn: $isOn)
             Text(label.uppercased())
                 .font(Typeface.font(9, .medium))
-                .tracking(1.5)
+                .tracking(Typeface.tracking(1.5))
                 .foregroundStyle(palette.textColor.opacity(0.45))
                 .fixedSize()
         }

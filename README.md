@@ -10,7 +10,7 @@ A macOS visualiser that taps the audio your Mac is playing (Spotify, Music, a br
 
 Glowing lines on plain black. Customisation is a deck of knobs (drag to turn, double-click to reset)
 that slides up from the bottom: colours (colour wheel, hex or R/G/B knobs, with an optional bass-to-treble
-gradient and automatic colour cycling), glow, trails, line weight, CRT lines and per-mode options. Settings persist between launches.
+gradient, automatic colour cycling, or colours taken from the playing album's artwork), glow, trails, line weight, CRT lines and per-mode options. Settings persist between launches.
 
 When Spotify is playing, the title, artist, album, artwork and progress show under the logo, and briefly
 appear on each track change even with the interface hidden.

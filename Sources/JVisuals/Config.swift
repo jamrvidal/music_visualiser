@@ -7,7 +7,7 @@ enum VisualMode: String, Codable, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .scope: "Scope"
-        case .xy: "X · Y"
+        case .xy: "X \(Typeface.dot) Y"
         case .spectrum: "Spectrum"
         case .pulse: "Pulse"
         }
@@ -74,6 +74,8 @@ struct Config: Codable, Equatable {
     var cycleColors = false
     /// Full trips around the colour wheel per minute.
     var cycleSpeed: Double = 4
+    /// Take the colours from the playing album's artwork (falls back to `primary`/`secondary`).
+    var albumColors = false
 
     // Scope
     var scopeStyle: ScopeStyle = .line
@@ -132,8 +134,34 @@ final class VisualSettings: ObservableObject {
         }
     }
 
+    /// Colours picked from the playing album's artwork while `albumColors` is on. Not saved.
+    @Published private(set) var artworkColors: BaseColors?
+    /// What was showing when `artworkColors` last changed, faded out over `fadeDuration` from `fadeStart`.
+    private var fadeFrom: BaseColors?
+    private(set) var fadeStart = Date.distantPast
+    static let fadeDuration = 1.5
+
     init() {
         config = Self.load() ?? Config()
+    }
+
+    func setArtworkColors(_ colors: BaseColors?) {
+        guard colors != artworkColors else { return }
+        let now = Date()
+        fadeFrom = baseColors(at: now)
+        fadeStart = now
+        artworkColors = colors
+    }
+
+    /// The colours to show before cycling: the artwork's if there are any, else the chosen ones,
+    /// crossfading for a moment after each change.
+    func baseColors(at date: Date) -> BaseColors {
+        let target = artworkColors ?? BaseColors(config)
+        let t = Float(date.timeIntervalSince(fadeStart) / Self.fadeDuration)
+        guard let fadeFrom, t < 1 else { return target }
+        let eased = t * t * (3 - 2 * t)
+        return BaseColors(primary: fadeFrom.primary + (target.primary - fadeFrom.primary) * eased,
+                          secondary: fadeFrom.secondary + (target.secondary - fadeFrom.secondary) * eased)
     }
 
     /// Saved values laid over the defaults, so settings survive when new fields are added.
@@ -155,6 +183,7 @@ final class VisualSettings: ObservableObject {
         fresh.primary = config.primary
         fresh.secondary = config.secondary
         fresh.gradient = config.gradient
+        fresh.albumColors = config.albumColors
         config = fresh
     }
 }
@@ -177,6 +206,20 @@ enum Hex {
     }
 }
 
+/// The two colours everything else is derived from.
+struct BaseColors: Equatable {
+    var primary: SIMD3<Float>
+    var secondary: SIMD3<Float>
+}
+
+extension BaseColors {
+    /// The colours chosen in the controls.
+    init(_ config: Config) {
+        self.init(primary: Hex.parse(config.primary) ?? [0.5, 0.82, 1],
+                  secondary: Hex.parse(config.secondary) ?? [0.18, 0.36, 1])
+    }
+}
+
 /// Colours derived from the chosen primary/secondary, shared by the renderer (SIMD) and interface (SwiftUI).
 struct Palette {
     let primary: SIMD3<Float>
@@ -189,11 +232,17 @@ struct Palette {
         self.usesGradient = usesGradient
     }
 
-    /// The configured colours; with colour cycling on, both are turned around the hue wheel by an amount set
-    /// by the wall clock, so the renderer and the interface stay in step without sharing state.
-    init(_ config: Config, at date: Date = Date()) {
-        var primary = Hex.parse(config.primary) ?? [0.5, 0.82, 1]
-        var secondary = Hex.parse(config.secondary) ?? [0.18, 0.36, 1]
+    /// The current colours (chosen or from album artwork), as both the renderer and interface show them.
+    init(_ settings: VisualSettings, at date: Date = Date()) {
+        self.init(settings.config, base: settings.baseColors(at: date), at: date)
+    }
+
+    /// The base colours (the configured ones by default); with colour cycling on, both are turned around the
+    /// hue wheel by an amount set by the wall clock, so the renderer and the interface stay in step without
+    /// sharing state.
+    init(_ config: Config, base: BaseColors? = nil, at date: Date = Date()) {
+        let base = base ?? BaseColors(config)
+        var primary = base.primary, secondary = base.secondary
         if config.cycleColors {
             let turns = date.timeIntervalSinceReferenceDate * config.cycleSpeed / 60
             let shift = Float(turns - turns.rounded(.down))

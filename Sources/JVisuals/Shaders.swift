@@ -128,25 +128,59 @@ struct PresentUniforms {
     float scanlines;
 };
 
-// One bloom layer from a downscaled mip. Four bilinear taps a texel apart form a tent filter, which hides
-// the blocky look a single stretched low-res sample has.
-float3 bloomLayer(texture2d<float> accum, sampler s, float2 uv, float lod, float2 viewport) {
-    float2 texel = exp2(lod) / viewport;
-    return 0.25 * (accum.sample(s, uv + texel * float2( 1,  1), level(lod)).rgb
-                 + accum.sample(s, uv + texel * float2(-1,  1), level(lod)).rgb
-                 + accum.sample(s, uv + texel * float2( 1, -1), level(lod)).rgb
-                 + accum.sample(s, uv + texel * float2(-1, -1), level(lod)).rgb);
+// MARK: Bloom chain
+
+constexpr sampler bloomSampler(filter::linear, address::clamp_to_edge);
+
+// Halves the source with a 13-tap filter (overlapping 4×4 boxes), which stays smooth where a plain 2×2
+// average would turn thin lines into blocks that crawl as they move.
+fragment float4 bloom_down_fragment(FSOut in [[stage_in]], texture2d<float> source [[texture(0)]]) {
+    float2 t = 1.0 / float2(source.get_width(), source.get_height());
+    float2 uv = in.uv;
+    float3 a = source.sample(bloomSampler, uv + t * float2(-2, -2)).rgb;
+    float3 b = source.sample(bloomSampler, uv + t * float2( 0, -2)).rgb;
+    float3 c = source.sample(bloomSampler, uv + t * float2( 2, -2)).rgb;
+    float3 d = source.sample(bloomSampler, uv + t * float2(-2,  0)).rgb;
+    float3 e = source.sample(bloomSampler, uv).rgb;
+    float3 f = source.sample(bloomSampler, uv + t * float2( 2,  0)).rgb;
+    float3 g = source.sample(bloomSampler, uv + t * float2(-2,  2)).rgb;
+    float3 h = source.sample(bloomSampler, uv + t * float2( 0,  2)).rgb;
+    float3 i = source.sample(bloomSampler, uv + t * float2( 2,  2)).rgb;
+    float3 j = source.sample(bloomSampler, uv + t * float2(-1, -1)).rgb;
+    float3 k = source.sample(bloomSampler, uv + t * float2( 1, -1)).rgb;
+    float3 l = source.sample(bloomSampler, uv + t * float2(-1,  1)).rgb;
+    float3 m = source.sample(bloomSampler, uv + t * float2( 1,  1)).rgb;
+    float3 sum = e * 0.125 + (a + c + g + i) * 0.03125 + (b + d + f + h) * 0.0625 + (j + k + l + m) * 0.125;
+    return float4(sum, 1.0);
+}
+
+// 3×3 tent filter, used to stretch a smaller level back up without blocky edges.
+float3 tent(texture2d<float> source, float2 uv) {
+    float2 t = 1.0 / float2(source.get_width(), source.get_height());
+    float3 sum = source.sample(bloomSampler, uv).rgb * 4.0;
+    sum += (source.sample(bloomSampler, uv + t * float2( 0, -1)).rgb
+          + source.sample(bloomSampler, uv + t * float2(-1,  0)).rgb
+          + source.sample(bloomSampler, uv + t * float2( 1,  0)).rgb
+          + source.sample(bloomSampler, uv + t * float2( 0,  1)).rgb) * 2.0;
+    sum += source.sample(bloomSampler, uv + t * float2(-1, -1)).rgb
+         + source.sample(bloomSampler, uv + t * float2( 1, -1)).rgb
+         + source.sample(bloomSampler, uv + t * float2(-1,  1)).rgb
+         + source.sample(bloomSampler, uv + t * float2( 1,  1)).rgb;
+    return sum / 16.0;
+}
+
+// Blended over the next level up by a constant factor, so each level mixes in all the wider ones below it.
+fragment float4 bloom_up_fragment(FSOut in [[stage_in]], texture2d<float> source [[texture(0)]]) {
+    return float4(tent(source, in.uv), 1.0);
 }
 
 fragment float4 present_fragment(FSOut in [[stage_in]],
                                  texture2d<float> accum [[texture(0)]],
+                                 texture2d<float> bloomTexture [[texture(1)]],
                                  constant PresentUniforms &p [[buffer(0)]]) {
-    constexpr sampler s(filter::linear, mip_filter::linear, address::clamp_to_edge);
-    float3 light = accum.sample(s, in.uv, level(0.0)).rgb;
-    float3 bloom = bloomLayer(accum, s, in.uv, 1.5, p.viewport) * 0.5
-                 + bloomLayer(accum, s, in.uv, 3.5, p.viewport) * 0.3
-                 + bloomLayer(accum, s, in.uv, 5.5, p.viewport) * 0.2;
-    light += bloom * p.bloom;
+    constexpr sampler s(filter::linear, address::clamp_to_edge);
+    float3 light = accum.sample(s, in.uv).rgb;
+    light += tent(bloomTexture, in.uv) * p.bloom;
     float3 c = 1.0 - exp(-light * p.exposure);
 
     if (p.grid > 0.0) {

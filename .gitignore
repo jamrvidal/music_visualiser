@@ -2,3 +2,5 @@
 build/
 .swiftpm/
 .DS_Store
+CLAUDE.md
+Support/Fonts/
